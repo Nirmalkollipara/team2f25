@@ -1,53 +1,54 @@
-FROM python:3.11-slim
+# ---------- Builder: build wheels so we don't ship dev tools ----------
+FROM python:3.11-slim-bookworm AS builder
 
-# Python settings
-ENV PYTHONDONTWRITEBYTECODE=1 \
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
-
-# Install system dependencies
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends \
-    curl ca-certificates bash nginx dos2unix \
-    fonts-liberation libglib2.0-0 libnss3 libnspr4 \
-    libatk1.0-0 libatk-bridge2.0-0 libcups2 libdbus-1-3 \
-    libxkbcommon0 libxcomposite1 libxrandr2 libxdamage1 \
-    libxfixes3 libdrm2 libgbm1 libasound2 libxshmfence1 \
-    libpango-1.0-0 libcairo2 libx11-6 libxext6 \
-    libx11-xcb1 libxcb1 && \
-    rm -rf /var/lib/apt/lists/* && \
-    curl -fsSL https://ollama.com/install.sh | sh
 
 WORKDIR /app
 
-# Python requirements
+# Install minimal build tools for any dependencies that need compiling
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends build-essential \
+ && rm -rf /var/lib/apt/lists/*
+
+# Install and build dependency wheels
 COPY requirements.txt .
-RUN python -m pip install --upgrade pip && \
-    pip install --no-cache-dir -r requirements.txt
+RUN python -m pip install --upgrade pip setuptools wheel \
+ && pip wheel --no-cache-dir -r requirements.txt -w /wheels
 
-# Install Playwright
-RUN playwright install chromium && \
-    playwright install-deps chromium
 
-# Copy application files
-COPY app.py main.py scraper.py resume_manager.py playwright_fetcher.py resume_parser.py query_to_filter.py backend_navigator.py ui.py entrypoint.sh ./
-COPY assets/ ./assets
-COPY cover_letter/ ./cover_letter
-COPY styles.css ./
+# ---------- Runtime: smaller, patched OS + only final deps ----------
+# Replace <PUT_CURRENT_DIGEST_HERE> with the actual digest for reproducibility
+FROM python:3.11-slim-bookworm@sha256:<PUT_CURRENT_DIGEST_HERE>
 
-# Copy nginx configuration
-COPY nginx.conf /etc/nginx/nginx.conf
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
 
-# Ensure entrypoint is UNIX format and executable
-RUN dos2unix /app/*.sh && chmod +x /app/entrypoint.sh
+WORKDIR /app
 
-# Environment variables
-ENV MODEL_NAME=qwen2.5:0.5b \
-    USE_OLLAMA=1 \
-    OLLAMA_HOST=http://127.0.0.1:11434 \
-    STREAMLIT_SERVER_PORT=5002 \
-    STREAMLIT_SERVER_BASE_URL_PATH=team2f25 \
-    BACKEND_PORT=8000
+# Add non-root user
+RUN adduser --disabled-password --gecos "" appuser
 
-EXPOSE 80 5002 11434
+# Pull latest OS security patches (safe, small)
+RUN apt-get update \
+ && apt-get -y upgrade \
+ && rm -rf /var/lib/apt/lists/*
 
-ENTRYPOINT ["./entrypoint.sh"]
+# Copy prebuilt wheels and install them cleanly
+COPY --from=builder /wheels /wheels
+RUN pip install --no-cache-dir /wheels/*.whl \
+ && rm -rf /wheels
+
+# Copy your application source
+COPY . .
+
+# Drop privileges
+USER appuser
+
+# Expose port (Streamlit default = 5002)
+EXPOSE 5002
+
+# Start your app (adjust this command if needed)
+CMD ["streamlit", "run", "app.py", "--server.port=5002", "--server.address=0.0.0.0"]
